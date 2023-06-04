@@ -1,9 +1,8 @@
 #include "mbed.h"
 #include "shell.h"
-#include "USBSerial.h"
-#include "USBCDC.h"
 
 #define ENCODER_MAX 65535
+
 using namespace std::chrono;
 
 CAN can(PB_8, PB_9,1000000); // RX, TX, baud rate
@@ -15,10 +14,12 @@ struct frame
   uint32_t ts;
   int16_t current;
   int32_t pos;
+  int8_t cur_cmd;
 }__attribute__((packed, aligned(1)));
 
-// USBCDC cdc;
-USBSerial serial;
+// static BufferedSerial pc(USBTX, USBRX, 921600);
+static BufferedSerial pc(USBTX, USBRX, 576000);
+// USBSerial serial;
 
 /// @brief Transforms Motor ID + Data into CANMessage (autocomplete data field by zeros)
 /// @param ID Motor ID (1~32)
@@ -211,7 +212,6 @@ void read_angle(int ID) {
     shell_print("Angle position (single round) (°):");
     shell_print((float)angle/100);
     shell_println();
-
 }
 
 /// @brief Read the motor temperature, voltage and error status flags of the selected Motor
@@ -806,8 +806,9 @@ SHELL_COMMAND(read_power, "Read the motor power consumption (Strange value for n
   }
 }
 
-
-// Commands for Aquisition program
+//**********************************************************************************************************//
+// -------------------------------------Commands for Aquisition program-------------------------------------//
+//**********************************************************************************************************//
 
 /// @brief Acquisition program
 void acquisition() {
@@ -825,9 +826,10 @@ void acquisition() {
     uint8_t pos1 = rcv_msg_init.data[7];
     uint16_t old_pos = (pos1 << 8) | pos0;
 
-    int LO=-45;
-    int HI=45;
-    size_t nb_exp = 20000;
+    int torque = 0;
+    int LO=-10;
+    int HI=10;
+    size_t nb_exp = 30000;
 
     int tour = 0;
     // int t_old = duration_cast<microseconds>(t.elapsed_time()).count();
@@ -837,7 +839,7 @@ void acquisition() {
         std::srand(duration_cast<microseconds>(t.elapsed_time()).count());
         CANMessage rcv_msg = send_cmd(cmd);
         if (!(i % 1000)){
-            int torque = LO + rand()/(RAND_MAX/(HI-LO));
+            torque = LO + rand()/(RAND_MAX/(HI-LO));
             uint8_t byte0 = torque & 255;
             uint8_t byte1 = (torque >> 8);
             CANMessage cmd_torque = build_can_cmd(1,'\xA1','\x00','\x00','\x00', byte0, byte1);
@@ -866,9 +868,11 @@ void acquisition() {
             f.current = current;
             f.pos = pos_multitour;
             f.ts = duration_cast<microseconds>(t.elapsed_time()).count();
+            f.cur_cmd = torque;
 
             // t_old = duration_cast<microseconds>(t.elapsed_time()).count();
-            serial.write(&f,12);
+            pc.write(&f,13);
+            // serial.write(&f,12);
         }
 
     }
@@ -876,16 +880,88 @@ void acquisition() {
     t.stop();
 }
 
-
 SHELL_COMMAND(exp, "For aquisition program")
 {
     acquisition();
 }
 
+int nb_tours = 0;
+int old_pos = 0;
+Timer ta;
+
+/// @brief 
+void init_motor() {
+    ta.start();
+    CANMessage cmd = build_can_cmd(1,'\x88');
+    CANMessage rcv_msg = send_cmd(cmd);
+    if (rcv_msg.data[0] == '\x88')
+    {
+      shell_print("Motor Started");
+      shell_println();
+    }
+
+    CANMessage cmd2 = build_can_cmd(1,'\x9C');
+    CANMessage rcv_msg2 = send_cmd(cmd2);
+    if (rcv_msg2.data[0] == '\x9C')
+    {
+      uint8_t angle0 = rcv_msg2.data[6];
+      uint8_t angle1 = rcv_msg2.data[7];
+      uint16_t angle = (angle1 << 8) | angle0;
+
+      old_pos = angle;
+
+      shell_print(duration_cast<microseconds>(ta.elapsed_time()).count());
+      shell_println();
+      shell_print(angle);
+      shell_println();
+    }
+
+}
+
+
+/// @brief Send Torque closed-loop command (-32A~32A) to the selected Motor and print position and time
+/// @param ID ID of the choosen Motor (1~32)
+void tq(float torque_raw) {
+
+    int torque = round((torque_raw*2000)/32);
+    uint8_t byte0 = torque & 255;
+    uint8_t byte1 = (torque >> 8);
+    CANMessage cmd = build_can_cmd(1,'\xA1','\x00','\x00','\x00', byte0, byte1);
+    CANMessage rcv_msg = send_cmd(cmd);
+    if (rcv_msg.data[0] == '\xA1'){
+
+        uint8_t pos0 = rcv_msg.data[6];
+        uint8_t pos1 = rcv_msg.data[7];
+        uint16_t pos = (pos1 << 8) | pos0;
+
+        nb_tours += angle_rel2abs(pos, old_pos);
+        old_pos = pos;
+        int32_t pos_multitour = ((float)pos+nb_tours*65535); // *360/65535/6
+
+        shell_print(duration_cast<microseconds>(ta.elapsed_time()).count());
+        shell_println();
+        shell_print((int)pos_multitour);
+        shell_println();
+    }
+
+    if (rcv_msg.data[0] == '\xA1' && rcv_msg.data[1] == '\x00' && rcv_msg.data[2] == '\x00' && rcv_msg.data[3] == '\x00' 
+        && rcv_msg.data[4] == '\x00' && rcv_msg.data[5] == '\x00' && (rcv_msg.data[6] == '\xF6' || rcv_msg.data[6] == '\xF2')){
+        shell_print("MotorError : three-loop operation error, switching to the current-loop safe state");
+        shell_println();
+    }
+}
+
+SHELL_COMMAND(tq, "torque no return")
+{
+    tq(atof(argv[0]));
+}
+
 int main() {
-    shell_init(&serial);
+    shell_init(&pc); 
+    init_motor(); 
+    // shell_init(&serial);
     while(1){
-        ThisThread::sleep_for(200ms);
+         ThisThread::sleep_for(200ms);
     }
 
 }
